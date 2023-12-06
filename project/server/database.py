@@ -2,7 +2,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 
-URL_DATABASE = 'sqlite:///./balloon.db'
+URL_DATABASE = 'sqlite:///:memory:'
 
 engine = create_engine(URL_DATABASE, connect_args = {"check_same_thread": False})
 

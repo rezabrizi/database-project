@@ -1,7 +1,7 @@
 from datetime import datetime
 import json
 
-from fastapi import FastAPI, HTTPException, Depends, APIRouter, WebSocket
+from fastapi import FastAPI, HTTPException, Depends, APIRouter, WebSocket, Request
 from typing import Annotated, List
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -9,15 +9,14 @@ from database import (SessionLocal, engine)
 import models
 from fastapi.middleware.cors import CORSMiddleware
 
-router = APIRouter()
 app = FastAPI()
+router = APIRouter()
 
 connected_clients: List[WebSocket] = []
 
 
 origins = [
-    "http://159.223.192.58:3000",
-    # Add other origins if necessary
+"*"
 ]
 
 app.add_middleware(
@@ -89,6 +88,7 @@ def get_all_users_and_wins(db: Session):
 
 async def broadcast_start_game(gameId: int):
     for client in connected_clients:
+        print("client", client)
         await client.send_text(json.dumps({"action": "start_game", "gameId": gameId}))
 
 
@@ -96,7 +96,6 @@ async def broadcast_start_game(gameId: int):
 @app.get("/")
 async def root():
     return {"message": "Hello World"}
-
 
 @app.post("/user/register", response_model=UserModel)
 async def register(user: UserBase, db: Session = Depends(get_db)):
@@ -111,7 +110,6 @@ async def register(user: UserBase, db: Session = Depends(get_db)):
         db.refresh(new_user)
         return UserModel(username=new_user.username, wins=new_user.wins)
 
-
 @app.post("/user/login", response_model=UserModel)
 async def login(user: UserBase, db: Session = Depends(get_db)):
     print (user)
@@ -123,12 +121,10 @@ async def login(user: UserBase, db: Session = Depends(get_db)):
     else:
         raise HTTPException(status_code=404, detail="User not found")
 
-
 @app.get("/users", response_model=List[UserModel])
 async def list_users(db: db_dependency):
     users_and_wins = get_all_users_and_wins(db)
     return users_and_wins
-
 
 @app.get("/games", response_model=List[GameModel])
 async def get_all_games(db: Session = Depends(get_db)):
@@ -141,7 +137,6 @@ async def get_all_games(db: Session = Depends(get_db)):
     # Return the list of game details
     return games
 
-
 @app.get("/game/users/{game_id}", response_model=List[UserScore])
 async def get_users_in_game(game_id: int, db: Session = Depends(get_db)):
     # Query the Score table for all scores with the given gameId
@@ -152,10 +147,11 @@ async def get_users_in_game(game_id: int, db: Session = Depends(get_db)):
 
     return users_scores
 
-
 @app.post("/game/enter", response_model=ScoreModel)
-async def enter_game(user: str, gameId: int, db: Session = Depends(get_db)):
-    print(gameId)
+async def enter_game(request: Request, db: Session = Depends(get_db)):
+    req = await request.json()
+    user, gameId = req['user'], req['gameId']
+
     # Check if the user exists
     user_exists = db.query(models.User).filter(models.User.username == user).first()
     if not user_exists:
@@ -177,7 +173,6 @@ async def enter_game(user: str, gameId: int, db: Session = Depends(get_db)):
     db.commit()
     return ScoreModel(username=new_score.username, gameId=new_score.gameId, score=new_score.score)
 
-
 @router.websocket("/ws/game")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -185,15 +180,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            data = await websocket.receive_text()
-            # Handle any incoming messages if necessary
-
-    except Exception as e:
-        # Handle disconnection or errors
-        pass
-
+            await websocket.receive_text()
+    except:
+        print("error")
     finally:
-        connected_clients.remove(websocket)
+        await websocket.close()
+        print("hi")
 
 
 @app.post("/game/create_session")
@@ -208,16 +200,20 @@ async def create_game_session(db: Session = Depends(get_db)):
     return {"gameId": new_game.gameId, "message": "New game session created"}
 
 @app.post("/game/start")
-async def start_game(game_id: int, db: Session = Depends(get_db)):
-    # Check if the game session exists
-    game = db.query(models.Game).filter(models.Game.gameId == game_id).first()
-    if not game:
-        raise HTTPException(status_code=404, detail="Game session not found")
+async def start_game(game_id: int):
+    try:
+        db = SessionLocal()
+        # Check if the game session exists
+        game = db.query(models.Game).filter(models.Game.gameId == game_id).first()
 
-    # Broadcast start message with gameId to all connected clients
-    await broadcast_start_game(game_id)
-    return {"message": "Game started", "gameId": game_id}
+        if not game:
+            raise HTTPException(status_code=404, detail="Game session not found")
 
+        # Broadcast start message with gameId to all connected clients
+        await broadcast_start_game(game_id)
+        return {"message": "Game started", "gameId": game_id}
+    except Exception as e:
+        print(e)
 
 @app.post("/game/finalize")
 async def finalize_game(game_id: int, db: Session = Depends(get_db)):
@@ -239,11 +235,12 @@ async def finalize_game(game_id: int, db: Session = Depends(get_db)):
     else:
         raise HTTPException(status_code=404, detail="No scores found for this game session")
 
-
 @app.post("/game/submit_score")
-async def submit_score(username: str, gameId: int, score: int, db: Session = Depends(get_db)):
+async def submit_score(request: Request, db: Session = Depends(get_db)):
+    req = await request.json()
+    user, gameId, score = req['user'], req['gameId'], req['score']
     # Check if the score entry for the user and game exists
-    score_entry = db.query(models.Score).filter(models.Score.username == username, models.Score.gameId == gameId).first()
+    score_entry = db.query(models.Score).filter(models.Score.username == user, models.Score.gameId == gameId).first()
 
     if not score_entry:
         raise HTTPException(status_code=404, detail="Score entry not found")
@@ -253,4 +250,5 @@ async def submit_score(username: str, gameId: int, score: int, db: Session = Dep
     db.commit()
     return {"message": "Score updated successfully"}
 
+app.include_router(router)
 
