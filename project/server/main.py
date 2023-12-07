@@ -1,6 +1,6 @@
 from datetime import datetime
 import json
-
+from starlette.websockets import WebSocketDisconnect
 from fastapi import FastAPI, HTTPException, Depends, APIRouter, WebSocket, Request
 from typing import Annotated, List
 from sqlalchemy.orm import Session
@@ -12,9 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
 router = APIRouter()
 
-connected_clients: List[WebSocket] = []
 
-
+connected_clients = {}
 origins = [
 "*"
 ]
@@ -69,6 +68,15 @@ class ScoreModel(ScoreBase):
         orm_mode = True
 
 
+class LeaderboardEntry(BaseModel):
+    username: str
+    score: int
+
+    class Config:
+        orm_mode = True
+
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -84,13 +92,6 @@ models.Base.metadata.create_all(bind=engine)
 def get_all_users_and_wins(db: Session):
     users = db.query(models.User.username, models.User.wins).all()
     return users
-
-
-async def broadcast_start_game(gameId: int):
-    for client in connected_clients:
-        print("client", client)
-        await client.send_text(json.dumps({"action": "start_game", "gameId": gameId}))
-
 
 
 @app.get("/")
@@ -112,8 +113,6 @@ async def register(user: UserBase, db: Session = Depends(get_db)):
 
 @app.post("/user/login", response_model=UserModel)
 async def login(user: UserBase, db: Session = Depends(get_db)):
-    print (user)
-    print("hereeeee")
     db_user = db.query(models.User).filter(models.User.username == user.username).first()
 
     if db_user:
@@ -173,19 +172,42 @@ async def enter_game(request: Request, db: Session = Depends(get_db)):
     db.commit()
     return ScoreModel(username=new_score.username, gameId=new_score.gameId, score=new_score.score)
 
+
 @router.websocket("/ws/game")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    connected_clients.append(websocket)
+    client_id = id(websocket)  # Unique identifier for the websocket
+    connected_clients[client_id] = websocket
 
     try:
         while True:
             await websocket.receive_text()
-    except:
-        print("error")
+    except Exception as e:
+        print(f"Error in WebSocket connection: {e}")
     finally:
-        await websocket.close()
-        print("hi")
+        await safely_close_websocket(client_id)
+
+async def safely_close_websocket(client_id):
+    websocket = connected_clients.get(client_id)
+    if websocket:
+        try:
+            await websocket.close()
+            print(f"WebSocket connection closed: {client_id}")
+        except WebSocketDisconnect:
+            print(f"WebSocket already disconnected: {client_id}")
+        except RuntimeError as e:
+            print(f"RuntimeError occurred: {e}")
+        finally:
+            # Remove the client from the dictionary
+            connected_clients.pop(client_id, None)
+
+async def broadcast_start_game(gameId: int):
+    for client_id, websocket in connected_clients.items():
+        try:
+            await websocket.send_text(json.dumps({"action": "start_game", "gameId": gameId}))
+        except Exception as e:
+            print(f"Error sending message to client {client_id}: {e}")
+            await safely_close_websocket(client_id)
 
 
 @app.post("/game/create_session")
@@ -200,34 +222,43 @@ async def create_game_session(db: Session = Depends(get_db)):
     return {"gameId": new_game.gameId, "message": "New game session created"}
 
 @app.post("/game/start")
-async def start_game(game_id: int):
+async def start_game(request: Request):
     try:
+        print ('trying to start the fing game')
+        req = await request.json()
+        game_id = req['gameId']
         db = SessionLocal()
         # Check if the game session exists
         game = db.query(models.Game).filter(models.Game.gameId == game_id).first()
-
+        print(game)
         if not game:
+            print ("exceptionnnnn")
             raise HTTPException(status_code=404, detail="Game session not found")
 
         # Broadcast start message with gameId to all connected clients
         await broadcast_start_game(game_id)
+        print ("broadcased")
         return {"message": "Game started", "gameId": game_id}
     except Exception as e:
         print(e)
 
 @app.post("/game/finalize")
-async def finalize_game(game_id: int, db: Session = Depends(get_db)):
+async def finalize_game(request: Request, db: Session = Depends(get_db)):
     # Determine the winner based on the scores
+    req = await request.json()
+    game_id = req['game_id']
     winner_score = db.query(models.Score).filter(models.Score.gameId == game_id).order_by(models.Score.score.desc()).first()
-
+    print (winner_score)
     if winner_score:
         # Update the Game table
         game = db.query(models.Game).filter(models.Game.gameId == game_id).first()
         game.winner = winner_score.username
+        print (winner_score.username)
         game.maxScore = winner_score.score
 
         # Update the User table
         winner_user = db.query(models.User).filter(models.User.username == winner_score.username).first()
+        print(winner_user.username)
         winner_user.wins += 1
 
         db.commit()
@@ -252,3 +283,33 @@ async def submit_score(request: Request, db: Session = Depends(get_db)):
 
 app.include_router(router)
 
+
+@app.get("/game/{game_id}/leaderboard", response_model=List[LeaderboardEntry])
+async def get_game_leaderboard(game_id: int, db: Session = Depends(get_db)):
+    # Query the Score table for all scores with the given gameId
+    scores = db.query(models.Score).filter(models.Score.gameId == game_id).all()
+
+    # Create a list of LeaderboardEntry
+    leaderboard = [LeaderboardEntry(username=score.username, score=score.score) for score in scores]
+
+    return leaderboard
+
+
+
+
+@app.post("/clear_database")
+async def clear_database(db: Session = Depends(get_db)):
+    try:
+        # Delete all records from each table
+        db.query(models.User).delete()
+        db.query(models.Game).delete()
+        db.query(models.Score).delete()
+
+        # Commit the changes
+        db.commit()
+
+        return {"message": "Database cleared successfully"}
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
