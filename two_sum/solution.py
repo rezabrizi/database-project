@@ -1,1 +1,1 @@
-def two_sum(nums, target): return [i for i in range(len(nums)) if nums[i] == target]
+def TWOSUM(nums, target): return [i for i in range(len(nums)) if nums[i] == target]
